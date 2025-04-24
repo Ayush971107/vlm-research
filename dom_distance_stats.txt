@@ -1,0 +1,25 @@
+DOM Distance Statistics for HTML Files in data_main.csv
+==================================================
+
+Total HTML files analyzed: 13
+
+Maximum DOM distance: 119.0
+Minimum DOM distance: 0.0
+Average DOM distance: 24.08
+Median DOM distance: 3.00
+Standard deviation: 42.97
+25th percentile: 0.00
+75th percentile: 24.00
+
+Top 10 largest DOM distances:
+--------------------------------------------------
+_includes/cv-template.html: 119.0
+_includes/cv-template.html: 119.0
+_includes/archive-single.html: 24.0
+_layouts/single.html: 24.0
+_layouts/cv-layout.html: 10.0
+_layouts/cv-layout.html: 10.0
+_includes/social-share.html: 3.0
+_includes/masthead.html: 3.0
+_includes/intro-header.html: 1.0
+_layouts/default.html: 0.0
