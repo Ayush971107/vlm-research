@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 import time
 import os
 import pickle
+import multiprocessing as mp
 from dotenv import load_dotenv
 
 # Load environment variables (if needed)
@@ -26,7 +27,6 @@ def parse_html_to_dom(html_str):
     try:
         return html.fromstring(html_str)
     except Exception as e:
-        logger.error(f"Error parsing HTML to DOM: {str(e)}")
         # Return a minimal DOM if parsing fails
         return html.fromstring("<html><body></body></html>")
 
@@ -51,7 +51,6 @@ def compute_tree_edit_distance(html1, html2):
         tree2 = build_zss_tree(dom2)
         return simple_distance(tree1, tree2)
     except Exception as e:
-        logger.error(f"Error computing DOM distance: {str(e)}")
         # Return a value to avoid losing data on error
         return 100  # Using an arbitrary high value
 
@@ -60,8 +59,26 @@ def prettify_html(html_content):
     try:
         return BeautifulSoup(html_content, "html.parser").prettify()
     except Exception as e:
-        logger.error(f"Error prettifying HTML: {e}")
         return html_content
+
+def process_row(args):
+    """
+    Worker function: given (idx, before_html, after_html, file_name),
+    prettify, compute DOM distance (with error handling), and return a tuple.
+    """
+    idx, before_html, after_html, file_name = args
+    try:
+        if pd.isna(before_html) or pd.isna(after_html):
+            return idx, None, file_name, "missing", "Missing HTML content"
+
+        before_html = prettify_html(before_html)
+        after_html = prettify_html(after_html)
+        dist = compute_tree_edit_distance(before_html, after_html)
+        return idx, dist, file_name, None, None
+
+    except Exception as e:
+        error_msg = f"Error processing row {idx}: {str(e)}"
+        return idx, None, file_name, "error", error_msg
 
 def save_checkpoint(current_row, stats):
     """Save checkpoint data to resume processing later"""
@@ -165,60 +182,88 @@ def calculate_dom_distance_stats():
         logger.error(f"Error loading data: {e}")
         return
     
-    # Process each row, starting from where we left off
+    # Build list of tasks for multiprocessing
+    tasks = []
     for idx, row in html_files.iloc[current_row+1:].iterrows():
-        logger.info(f"Processing row {idx+1}/{len(html_files)}")
-        
-        try:
-            before_html = row['page before commit']
-            after_html = row['page after commit']
-            
-            # Skip rows with missing HTML content
-            if pd.isna(before_html) or pd.isna(after_html):
-                logger.warning(f"Missing HTML content for row {idx}")
-                current_row = idx
-                save_checkpoint(current_row, stats)
-                continue
-            
-            # Prettify HTML for better parsing
-            before_html = prettify_html(before_html)
-            after_html = prettify_html(after_html)
-            
-            # Calculate DOM distance
-            distance = compute_tree_edit_distance(before_html, after_html)
-            
-            # Track zero and non-zero distances separately
-            if distance == 0:
-                stats['zero_count'] += 1
-                logger.info(f"Distance calculated: {distance} (skipped for statistics)")
-            else:
-                # Update running statistics for non-zero distances
-                stats['non_zero_count'] += 1
-                stats['sum'] += distance
-                stats['sum_squared'] += distance * distance
-                stats['min'] = min(stats['min'], distance)
-                stats['max'] = max(stats['max'], distance)
-                
-                # Update top 10 list
-                stats['top_10'].append((distance, row['file name']))
-                stats['top_10'].sort(reverse=True, key=lambda x: x[0])
-                stats['top_10'] = stats['top_10'][:10]  # Keep only top 10
-                
-                # Store for median/percentile calculation
-                non_zero_distances.append(distance)
-                
-                logger.info(f"Distance calculated: {distance}")
-            
-            # Save checkpoint after each row
-            current_row = idx
-            save_checkpoint(current_row, stats)
-            
-        except Exception as e:
-            logger.error(f"Error processing row {idx}: {e}")
-            current_row = idx
-            save_checkpoint(current_row, stats)
-            continue
+        tasks.append((
+            idx,
+            row['page before commit'],
+            row['page after commit'],
+            row['file name']
+        ))
     
+    if not tasks:
+        logger.info("No new rows to process")
+        # If there are no tasks but we have stats from previous runs, calculate final stats
+        if stats['non_zero_count'] > 0:
+            return calculate_final_stats(stats, non_zero_distances, html_files['url'].nunique())
+        return None
+    
+    total_tasks = len(tasks)
+    logger.info(f"Processing {total_tasks} rows using multiprocessing")
+    
+    # Use multiprocessing to parallelize the distance calculations
+    # Use one less than available cores to avoid overloading the system
+    num_cores = max(1, mp.cpu_count() - 1)
+    logger.info(f"Using {num_cores} CPU cores for parallel processing")
+    
+    # Progress tracking
+    completed = 0
+    
+    # Use multiprocessing pool to process rows in parallel
+    with mp.Pool(num_cores) as pool:
+        for idx, distance, file_name, error_type, error_msg in pool.imap_unordered(process_row, tasks, chunksize=1):
+            completed += 1
+            
+            # Ensure current_row is always the highest processed index
+            current_row = max(current_row, idx)
+            
+            # Handle different result types
+            if error_type == "missing":
+                logger.warning(f"Missing HTML content for row {idx}")
+            elif error_type == "error":
+                logger.error(error_msg)
+            else:
+                # Track zero and non-zero distances separately
+                if distance == 0:
+                    stats['zero_count'] += 1
+                    logger.info(f"Row {idx}: Distance = {distance} (skipped for statistics)")
+                else:
+                    # Update running statistics for non-zero distances
+                    stats['non_zero_count'] += 1
+                    stats['sum'] += distance
+                    stats['sum_squared'] += distance * distance
+                    stats['min'] = min(stats['min'], distance)
+                    stats['max'] = max(stats['max'], distance)
+                    
+                    # Update top 10 list
+                    stats['top_10'].append((distance, file_name))
+                    stats['top_10'].sort(reverse=True, key=lambda x: x[0])
+                    stats['top_10'] = stats['top_10'][:10]  # Keep only top 10
+                    
+                    # Store for median/percentile calculation
+                    non_zero_distances.append(distance)
+                    
+                    logger.info(f"Row {idx}: Distance = {distance}")
+            
+            # Log progress (showing completed/total)
+            if completed % 10 == 0 or completed == total_tasks:
+                logger.info(f"Progress: {completed}/{total_tasks} ({completed/total_tasks*100:.1f}%)")
+            
+            # Save checkpoint every 50 rows instead of after each row
+            if completed % 50 == 0:
+                logger.info(f"Saving checkpoint at {completed} rows processed")
+                save_checkpoint(current_row, stats)
+    
+    # Final checkpoint after all processing completes
+    logger.info("Processing complete. Saving final checkpoint.")
+    save_checkpoint(current_row, stats)
+    
+    logger.info(f"Processed {completed} rows. Calculating final statistics...")
+    return calculate_final_stats(stats, non_zero_distances, html_files['url'].nunique())
+
+def calculate_final_stats(stats, non_zero_distances, unique_urls_count):
+    """Calculate final statistics from the collected data"""
     # If no non-zero distances were found, return
     if stats['non_zero_count'] == 0:
         logger.warning("No DOM distances >= 1 could be calculated!")
@@ -254,7 +299,7 @@ def calculate_dom_distance_stats():
         'std': std_dev,
         'percentile_25': percentile_25,
         'percentile_75': percentile_75,
-        'unique_urls': html_files['url'].nunique(),
+        'unique_urls': unique_urls_count,
         'top_10': stats['top_10']
     }
     
