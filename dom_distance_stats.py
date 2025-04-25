@@ -21,7 +21,21 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_FILE = 'dd_checkpoint.pkl'
 CSV_FILE = 'data_main.csv'
 PARQUET_FILE = 'data_main_html.parquet'
+CHUNK_SIZE = 50  # Process 50 rows per chunk
 
+# Global variable for worker processes
+html_df = None
+
+def init_worker(parquet_path):
+    """Initialize worker process with its own copy of the DataFrame"""
+    global html_df
+    # Use fast Parquet reader, loading only required columns
+    html_df = pd.read_parquet(parquet_path, columns=[
+        'page before commit',
+        'page after commit',
+        'file name'
+    ])
+    
 # DOM distance functions from scrape3.py
 def parse_html_to_dom(html_str):
     try:
@@ -61,13 +75,18 @@ def prettify_html(html_content):
     except Exception as e:
         return html_content
 
-def process_row(args):
+def process_row(idx):
     """
-    Worker function: given (idx, before_html, after_html, file_name),
-    prettify, compute DOM distance (with error handling), and return a tuple.
+    Worker function: given the row index, retrieve the HTML data and compute the distance.
+    
+    Returns tuple of (idx, distance, file_name, error_type, error_msg)
     """
-    idx, before_html, after_html, file_name = args
     try:
+        row = html_df.iloc[idx]
+        before_html = row['page before commit']
+        after_html = row['page after commit']
+        file_name = row['file name']
+        
         if pd.isna(before_html) or pd.isna(after_html):
             return idx, None, file_name, "missing", "Missing HTML content"
 
@@ -78,7 +97,7 @@ def process_row(args):
 
     except Exception as e:
         error_msg = f"Error processing row {idx}: {str(e)}"
-        return idx, None, file_name, "error", error_msg
+        return idx, None, file_name if 'file_name' in locals() else "unknown", "error", error_msg
 
 def save_checkpoint(current_row, stats):
     """Save checkpoint data to resume processing later"""
@@ -161,18 +180,20 @@ def calculate_dom_distance_stats():
     # For calculating median and percentiles, we need to track non-zero distances
     non_zero_distances = []
     
-    # Load HTML files (from Parquet if available, otherwise CSV)
+    # Load metadata from the HTML files (don't need all data in the main process)
     try:
+        # Just get the file structure to understand the indices
         if os.path.exists(PARQUET_FILE):
-            logger.info(f"Loading data from {PARQUET_FILE}...")
-            html_files = pd.read_parquet(PARQUET_FILE)
-            logger.info(f"Loaded {len(html_files)} rows from Parquet")
+            logger.info(f"Loading metadata from {PARQUET_FILE}...")
+            # Only load minimal info for the main process
+            html_files = pd.read_parquet(PARQUET_FILE, columns=['file name'])
+            logger.info(f"Found {len(html_files)} HTML rows in Parquet file")
         else:
             # Fallback to CSV
-            logger.info("Reading data_main.csv...")
-            df = pd.read_csv(CSV_FILE)
+            logger.info("Reading metadata from data_main.csv...")
+            df = pd.read_csv(CSV_FILE, usecols=['file name'])
             html_files = df[df['file name'].str.endswith('.html', na=False)]
-            logger.info(f"Loaded {len(html_files)} HTML files from CSV")
+            logger.info(f"Found {len(html_files)} HTML files in CSV")
         
         if len(html_files) == 0:
             logger.warning("No HTML files found in the dataset!")
@@ -182,21 +203,14 @@ def calculate_dom_distance_stats():
         logger.error(f"Error loading data: {e}")
         return
     
-    # Build list of tasks for multiprocessing
-    tasks = []
-    for idx, row in html_files.iloc[current_row+1:].iterrows():
-        tasks.append((
-            idx,
-            row['page before commit'],
-            row['page after commit'],
-            row['file name']
-        ))
+    # Get list of row indices to process
+    tasks = list(range(current_row + 1, len(html_files)))
     
     if not tasks:
         logger.info("No new rows to process")
         # If there are no tasks but we have stats from previous runs, calculate final stats
         if stats['non_zero_count'] > 0:
-            return calculate_final_stats(stats, non_zero_distances, html_files['url'].nunique())
+            return calculate_final_stats(stats, non_zero_distances, 0)  # URL count will be calculated later
         return None
     
     total_tasks = len(tasks)
@@ -205,14 +219,18 @@ def calculate_dom_distance_stats():
     # Use multiprocessing to parallelize the distance calculations
     # Use one less than available cores to avoid overloading the system
     num_cores = max(1, mp.cpu_count() - 1)
-    logger.info(f"Using {num_cores} CPU cores for parallel processing")
+    logger.info(f"Using {num_cores} CPU cores for parallel processing with chunk size {CHUNK_SIZE}")
     
     # Progress tracking
     completed = 0
     
     # Use multiprocessing pool to process rows in parallel
-    with mp.Pool(num_cores) as pool:
-        for idx, distance, file_name, error_type, error_msg in pool.imap_unordered(process_row, tasks, chunksize=1):
+    with mp.Pool(
+        processes=num_cores,
+        initializer=init_worker,
+        initargs=(PARQUET_FILE,)
+    ) as pool:
+        for idx, distance, file_name, error_type, error_msg in pool.imap_unordered(process_row, tasks, chunksize=CHUNK_SIZE):
             completed += 1
             
             # Ensure current_row is always the highest processed index
@@ -260,7 +278,17 @@ def calculate_dom_distance_stats():
     save_checkpoint(current_row, stats)
     
     logger.info(f"Processed {completed} rows. Calculating final statistics...")
-    return calculate_final_stats(stats, non_zero_distances, html_files['url'].nunique())
+    
+    # Now load the full data to get URL count
+    url_count = 0
+    try:
+        # Load to get URL count
+        df_for_urls = pd.read_parquet(PARQUET_FILE, columns=['url'])
+        url_count = df_for_urls['url'].nunique()
+    except Exception as e:
+        logger.error(f"Error getting unique URL count: {e}")
+    
+    return calculate_final_stats(stats, non_zero_distances, url_count)
 
 def calculate_final_stats(stats, non_zero_distances, unique_urls_count):
     """Calculate final statistics from the collected data"""
