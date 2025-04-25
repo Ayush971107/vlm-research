@@ -6,6 +6,7 @@ from zss import Node, simple_distance
 from bs4 import BeautifulSoup
 import time
 import os
+import pickle
 from dotenv import load_dotenv
 
 # Load environment variables (if needed)
@@ -14,6 +15,11 @@ load_dotenv()
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Constants
+CHECKPOINT_FILE = 'dd_checkpoint.pkl'
+CSV_FILE = 'data_main.csv'
+PARQUET_FILE = 'data_main_html.parquet'
 
 # DOM distance functions from scrape3.py
 def parse_html_to_dom(html_str):
@@ -57,111 +63,231 @@ def prettify_html(html_content):
         logger.error(f"Error prettifying HTML: {e}")
         return html_content
 
+def save_checkpoint(current_row, stats):
+    """Save checkpoint data to resume processing later"""
+    checkpoint = {
+        'current_row': current_row,
+        'stats': stats
+    }
+    with open(CHECKPOINT_FILE, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    logger.info(f"Checkpoint saved at row {current_row}")
+
+def load_checkpoint():
+    """Load checkpoint data if it exists"""
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'rb') as f:
+                checkpoint = pickle.load(f)
+            logger.info(f"Checkpoint loaded. Resuming from row {checkpoint['current_row'] + 1}")
+            return checkpoint
+        except Exception as e:
+            logger.error(f"Error loading checkpoint: {e}")
+    
+    # Initialize new stats structure
+    stats = {
+        'non_zero_count': 0,       # Count of distances > 0
+        'zero_count': 0,           # Count of distances = 0
+        'sum': 0,                  # Sum for mean calculation
+        'sum_squared': 0,          # Sum of squares for std calculation
+        'min': float('inf'),       # Minimum non-zero distance
+        'max': 0,                  # Maximum distance
+        'top_10': []               # List of (distance, file_name) tuples for top 10
+    }
+    return {'current_row': -1, 'stats': stats}
+
+def prepare_parquet_file():
+    """
+    Convert CSV to Parquet format if not already done.
+    Parquet loads 10-50x faster than CSV for subsequent processing.
+    """
+    if os.path.exists(PARQUET_FILE):
+        logger.info(f"Parquet file {PARQUET_FILE} already exists, using it")
+        return True
+        
+    logger.info(f"Converting {CSV_FILE} to Parquet format for faster loading")
+    try:
+        # Read the CSV file
+        logger.info(f"Reading {CSV_FILE}...")
+        df = pd.read_csv(CSV_FILE)
+        
+        # Filter HTML files only to save space
+        html_files = df[df['file name'].str.endswith('.html', na=False)]
+        logger.info(f"Found {len(html_files)} HTML files out of {len(df)} total rows")
+        
+        # Save as Parquet
+        html_files.reset_index(drop=True).to_parquet(PARQUET_FILE, index=False)
+        logger.info(f"Saved HTML files to {PARQUET_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"Error creating Parquet file: {e}")
+        return False
+
 def calculate_dom_distance_stats():
     """
-    Calculate DOM distance statistics from first50.csv
+    Calculate DOM distance statistics from data_main.csv
     
-    The function reads the first50.csv file, filters out non-HTML files,
+    The function reads the data_main.csv file, filters out non-HTML files,
     computes DOM distances between page before commit and page after commit,
     and calculates statistics (max, min, average, median).
+    Only pages with DOM distance >= 1 are included in statistics calculations.
     """
-    # Read the CSV file
-    logger.info("Reading first50.csv...")
+    # First convert to Parquet if needed
+    if not prepare_parquet_file():
+        logger.error("Failed to prepare Parquet file, falling back to CSV")
+    
+    # Load checkpoint or initialize stats
+    checkpoint = load_checkpoint()
+    current_row = checkpoint['current_row']
+    stats = checkpoint['stats']
+    
+    # For calculating median and percentiles, we need to track non-zero distances
+    non_zero_distances = []
+    
+    # Load HTML files (from Parquet if available, otherwise CSV)
     try:
-        df = pd.read_csv('data_main.csv')
+        if os.path.exists(PARQUET_FILE):
+            logger.info(f"Loading data from {PARQUET_FILE}...")
+            html_files = pd.read_parquet(PARQUET_FILE)
+            logger.info(f"Loaded {len(html_files)} rows from Parquet")
+        else:
+            # Fallback to CSV
+            logger.info("Reading data_main.csv...")
+            df = pd.read_csv(CSV_FILE)
+            html_files = df[df['file name'].str.endswith('.html', na=False)]
+            logger.info(f"Loaded {len(html_files)} HTML files from CSV")
+        
+        if len(html_files) == 0:
+            logger.warning("No HTML files found in the dataset!")
+            return
+            
     except Exception as e:
-        logger.error(f"Error reading first50.csv: {e}")
+        logger.error(f"Error loading data: {e}")
         return
     
-    logger.info(f"Total records in CSV: {len(df)}")
-    
-    # Filter for HTML files
-    html_files = df[df['file name'].str.endswith('.html', na=False)]
-    logger.info(f"HTML files found: {len(html_files)}")
-    
-    if len(html_files) == 0:
-        logger.warning("No HTML files found in the dataset!")
-        return
-    
-    # Calculate DOM distances
-    distances = []
-    
-    for index, row in html_files.iterrows():
-        logger.info(f"Processing row {index+1}/{len(html_files)}")
+    # Process each row, starting from where we left off
+    for idx, row in html_files.iloc[current_row+1:].iterrows():
+        logger.info(f"Processing row {idx+1}/{len(html_files)}")
         
         try:
             before_html = row['page before commit']
             after_html = row['page after commit']
             
-            # Ensure we have valid HTML
+            # Skip rows with missing HTML content
             if pd.isna(before_html) or pd.isna(after_html):
-                logger.warning(f"Missing HTML content for row {index}")
+                logger.warning(f"Missing HTML content for row {idx}")
+                current_row = idx
+                save_checkpoint(current_row, stats)
                 continue
-                
-            # Prettify HTML content
+            
+            # Prettify HTML for better parsing
             before_html = prettify_html(before_html)
             after_html = prettify_html(after_html)
             
             # Calculate DOM distance
             distance = compute_tree_edit_distance(before_html, after_html)
             
-            # Store result
-            distances.append({
-                'file_name': row['file name'],
-                'distance': distance
-            })
+            # Track zero and non-zero distances separately
+            if distance == 0:
+                stats['zero_count'] += 1
+                logger.info(f"Distance calculated: {distance} (skipped for statistics)")
+            else:
+                # Update running statistics for non-zero distances
+                stats['non_zero_count'] += 1
+                stats['sum'] += distance
+                stats['sum_squared'] += distance * distance
+                stats['min'] = min(stats['min'], distance)
+                stats['max'] = max(stats['max'], distance)
+                
+                # Update top 10 list
+                stats['top_10'].append((distance, row['file name']))
+                stats['top_10'].sort(reverse=True, key=lambda x: x[0])
+                stats['top_10'] = stats['top_10'][:10]  # Keep only top 10
+                
+                # Store for median/percentile calculation
+                non_zero_distances.append(distance)
+                
+                logger.info(f"Distance calculated: {distance}")
             
-            logger.info(f"Distance calculated: {distance}")
+            # Save checkpoint after each row
+            current_row = idx
+            save_checkpoint(current_row, stats)
             
         except Exception as e:
-            logger.error(f"Error processing row {index}: {e}")
+            logger.error(f"Error processing row {idx}: {e}")
+            current_row = idx
+            save_checkpoint(current_row, stats)
             continue
     
-    if not distances:
-        logger.warning("No DOM distances could be calculated!")
+    # If no non-zero distances were found, return
+    if stats['non_zero_count'] == 0:
+        logger.warning("No DOM distances >= 1 could be calculated!")
         return
     
-    # Convert to DataFrame for easier analysis
-    distances_df = pd.DataFrame(distances)
+    # Calculate final statistics
+    mean = stats['sum'] / stats['non_zero_count']
     
-    # Calculate statistics
-    stats = {
-        'count': len(distances),
-        'max': distances_df['distance'].max(),
-        'min': distances_df['distance'].min(),
-        'mean': distances_df['distance'].mean(),
-        'median': distances_df['distance'].median(),
-        'std': distances_df['distance'].std(),
-        'percentile_25': np.percentile(distances_df['distance'], 25),
-        'percentile_75': np.percentile(distances_df['distance'], 75),
-        'unique_urls': html_files['url'].nunique()  # Count unique URLs
+    # Calculate standard deviation
+    variance = (stats['sum_squared'] / stats['non_zero_count']) - (mean * mean)
+    std_dev = max(0, variance) ** 0.5  # Avoid negative values due to floating point errors
+    
+    # Calculate median and percentiles
+    if non_zero_distances:
+        median = np.median(non_zero_distances)
+        percentile_25 = np.percentile(non_zero_distances, 25)
+        percentile_75 = np.percentile(non_zero_distances, 75)
+    else:
+        # If we're resuming and don't have all distances for accurate percentiles
+        logger.warning("Using approximations for median and percentiles (incomplete data)")
+        median = mean
+        percentile_25 = stats['min']
+        percentile_75 = stats['max']
+    
+    # Prepare final statistics
+    final_stats = {
+        'count': stats['non_zero_count'],
+        'zero_count': stats['zero_count'],
+        'max': stats['max'],
+        'min': stats['min'],
+        'mean': mean,
+        'median': median,
+        'std': std_dev,
+        'percentile_25': percentile_25,
+        'percentile_75': percentile_75,
+        'unique_urls': html_files['url'].nunique(),
+        'top_10': stats['top_10']
     }
     
     # Write statistics to file
     with open('dom_distance_stats.txt', 'w') as f:
-        f.write("DOM Distance Statistics for HTML Files in first50.csv\n")
+        f.write("DOM Distance Statistics for HTML Files in data_main.csv\n")
         f.write("="*50 + "\n\n")
-        f.write(f"Total HTML files analyzed: {stats['count']}\n")
-        f.write(f"Number of unique URLs: {stats['unique_urls']}\n\n")
-        f.write(f"Maximum DOM distance: {stats['max']}\n")
-        f.write(f"Minimum DOM distance: {stats['min']}\n")
-        f.write(f"Average DOM distance: {stats['mean']:.2f}\n")
-        f.write(f"Median DOM distance: {stats['median']:.2f}\n")
-        f.write(f"Standard deviation: {stats['std']:.2f}\n")
-        f.write(f"25th percentile: {stats['percentile_25']:.2f}\n")
-        f.write(f"75th percentile: {stats['percentile_75']:.2f}\n\n")
+        f.write(f"Total HTML files analyzed: {final_stats['count'] + final_stats['zero_count']}\n")
+        f.write(f"Files with DOM distance >= 1: {final_stats['count']}\n")
+        f.write(f"Files with DOM distance = 0: {final_stats['zero_count']}\n")
+        f.write(f"Number of unique URLs: {final_stats['unique_urls']}\n\n")
+        f.write(f"Maximum DOM distance: {final_stats['max']}\n")
+        f.write(f"Minimum DOM distance: {final_stats['min']}\n")
+        f.write(f"Average DOM distance: {final_stats['mean']:.2f}\n")
+        f.write(f"Median DOM distance: {final_stats['median']:.2f}\n")
+        f.write(f"Standard deviation: {final_stats['std']:.2f}\n")
+        f.write(f"25th percentile: {final_stats['percentile_25']:.2f}\n")
+        f.write(f"75th percentile: {final_stats['percentile_75']:.2f}\n\n")
         
         # Add top 10 largest distances
         f.write("Top 10 largest DOM distances:\n")
         f.write("-"*50 + "\n")
-        top_10 = distances_df.sort_values('distance', ascending=False).head(10)
-        for idx, row in top_10.iterrows():
-            f.write(f"{row['file_name']}: {row['distance']}\n")
+        for distance, file_name in final_stats['top_10']:
+            f.write(f"{file_name}: {distance}\n")
             
     logger.info(f"Statistics written to dom_distance_stats.txt")
     
+    # Don't delete the checkpoint file after completion
+    # This allows us to avoid reprocessing data when running the script again
+    logger.info(f"Checkpoint file '{CHECKPOINT_FILE}' preserved for future runs")
+    
     # Return statistics for reference
-    return stats
+    return final_stats
 
 if __name__ == "__main__":
     start_time = time.time()
@@ -170,7 +296,9 @@ if __name__ == "__main__":
     
     if stats:
         print("\nDOM Distance Statistics Summary:")
-        print(f"Total files analyzed: {stats['count']}")
+        print(f"Total files analyzed: {stats['count'] + stats['zero_count']}")
+        print(f"Files with DOM distance >= 1: {stats['count']}")
+        print(f"Files with DOM distance = 0: {stats['zero_count']}")
         print(f"Unique URLs: {stats['unique_urls']}")
         print(f"Max: {stats['max']}")
         print(f"Min: {stats['min']}")
