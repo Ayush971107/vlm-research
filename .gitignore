@@ -6,3 +6,4 @@ scraper_checkpoint.pkl
 data_main.csv
 dd_checkpoint.pkl
 data_main_html.parquet
+dom_log.txt
