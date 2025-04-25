@@ -3,3 +3,5 @@ first50.py
 count_unique_urls.py
 scraper_checkpoint.pkl
 data_main.csv
+dd_checkpoint.pkl
+data_main_html.parquet
