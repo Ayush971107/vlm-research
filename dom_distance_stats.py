@@ -21,13 +21,12 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_FILE = 'dd_checkpoint.pkl'
 CSV_FILE = 'data_main.csv'
 PARQUET_FILE = 'data_main_html.parquet'
-CHUNK_SIZE = 50  # Process 50 rows per chunk
+CHUNK_SIZE = 10  
 
 # Global variable for worker processes
 html_df = None
 
 def init_worker(parquet_path):
-    """Initialize worker process with its own copy of the DataFrame"""
     global html_df
     # Use fast Parquet reader, loading only required columns
     html_df = pd.read_parquet(parquet_path, columns=[
@@ -36,7 +35,6 @@ def init_worker(parquet_path):
         'file name'
     ])
     
-# DOM distance functions from scrape3.py
 def parse_html_to_dom(html_str):
     try:
         return html.fromstring(html_str)
@@ -47,29 +45,18 @@ def parse_html_to_dom(html_str):
 def build_zss_tree(dom_node):
     node = Node(dom_node.tag)
     for child in dom_node:
-        # Skip text nodes or non-element nodes
         if isinstance(child.tag, str):
             node.addkid(build_zss_tree(child))
     return node
 
 def compute_tree_edit_distance(html1, html2):
-    try:
-        # Skip computation for non-existent pages
-        if html1 == "page does not exist" or html2 == "page does not exist":
-            # Return a high distance value to ensure it's recorded
-            return 100  # Using an arbitrary high value instead of threshold
-            
-        dom1 = parse_html_to_dom(html1)
-        dom2 = parse_html_to_dom(html2)
-        tree1 = build_zss_tree(dom1)
-        tree2 = build_zss_tree(dom2)
-        return simple_distance(tree1, tree2)
-    except Exception as e:
-        # Return a value to avoid losing data on error
-        return 100  # Using an arbitrary high value
+    dom1 = parse_html_to_dom(html1)
+    dom2 = parse_html_to_dom(html2)
+    tree1 = build_zss_tree(dom1)
+    tree2 = build_zss_tree(dom2)
+    return simple_distance(tree1, tree2)
 
 def prettify_html(html_content):
-    """Prettify HTML content for better parsing"""
     try:
         return BeautifulSoup(html_content, "html.parser").prettify()
     except Exception as e:
@@ -133,25 +120,15 @@ def load_checkpoint():
     return {'current_row': -1, 'stats': stats}
 
 def prepare_parquet_file():
-    """
-    Convert CSV to Parquet format if not already done.
-    Parquet loads 10-50x faster than CSV for subsequent processing.
-    """
     if os.path.exists(PARQUET_FILE):
         logger.info(f"Parquet file {PARQUET_FILE} already exists, using it")
         return True
-        
     logger.info(f"Converting {CSV_FILE} to Parquet format for faster loading")
     try:
-        # Read the CSV file
         logger.info(f"Reading {CSV_FILE}...")
         df = pd.read_csv(CSV_FILE)
-        
-        # Filter HTML files only to save space
         html_files = df[df['file name'].str.endswith('.html', na=False)]
         logger.info(f"Found {len(html_files)} HTML files out of {len(df)} total rows")
-        
-        # Save as Parquet
         html_files.reset_index(drop=True).to_parquet(PARQUET_FILE, index=False)
         logger.info(f"Saved HTML files to {PARQUET_FILE}")
         return True
@@ -217,8 +194,7 @@ def calculate_dom_distance_stats():
     logger.info(f"Processing {total_tasks} rows using multiprocessing")
     
     # Use multiprocessing to parallelize the distance calculations
-    # Use one less than available cores to avoid overloading the system
-    num_cores = max(1, mp.cpu_count() - 1)
+    num_cores = max(1, mp.cpu_count() - 2)
     logger.info(f"Using {num_cores} CPU cores for parallel processing with chunk size {CHUNK_SIZE}")
     
     # Progress tracking
